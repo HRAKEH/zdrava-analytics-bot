@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+data/
+*.sqlite*
+*.log
+.DS_Store
+# Never commit private keys/credentials to public GitHub
+*service-account*.json
+*credentials*.json
+*.pem
+*.key
