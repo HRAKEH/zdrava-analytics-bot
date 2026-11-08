@@ -1,9 +1,10 @@
-"""Optional Google Search Console integration using readonly service account."""
+"""Readonly Search Console API. Empty response is unknown, never an invented zero."""
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import math
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -19,10 +20,48 @@ class SearchConsoleError(RuntimeError):
 
 @dataclass(frozen=True)
 class SearchStats:
-    clicks: int
-    impressions: int
-    ctr: float
-    position: float
+    clicks: int | None
+    impressions: int | None
+    ctr: float | None
+    position: float | None
+
+    @property
+    def available(self) -> bool:
+        return self.clicks is not None and self.impressions is not None
+
+
+def _integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise SearchConsoleError(f"Google: отсутствует или некорректен показатель {field}")
+    if value < 0 or int(value) != value:
+        raise SearchConsoleError(f"Google: некорректное значение {field}")
+    return int(value)
+
+
+def parse_search_stats(payload: object) -> SearchStats:
+    if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+        raise SearchConsoleError("Google: неполный ответ API, числа скрыты")
+    rows = payload["rows"]
+    if not rows:
+        # Could be no traffic, not yet processed or inaccessible; API doesn't say which.
+        return SearchStats(None, None, None, None)
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        raise SearchConsoleError("Google: неожиданный формат строк")
+    row = rows[0]
+    clicks = _integer(row.get("clicks"), "clicks")
+    impressions = _integer(row.get("impressions"), "impressions")
+    if clicks > 0 and impressions == 0:
+        raise SearchConsoleError("Google: клики без показов; невозможно рассчитать CTR")
+    if impressions == 0:
+        return SearchStats(clicks, 0, None, None)
+    raw_ctr, raw_position = row.get("ctr"), row.get("position")
+    if not isinstance(raw_ctr, (int, float)) or isinstance(raw_ctr, bool) or not math.isfinite(raw_ctr):
+        raise SearchConsoleError("Google: нет корректного CTR")
+    if not isinstance(raw_position, (int, float)) or isinstance(raw_position, bool) or not math.isfinite(raw_position) or raw_position <= 0:
+        raise SearchConsoleError("Google: нет корректной позиции")
+    if raw_ctr < 0 or raw_ctr > 1 or abs((clicks / impressions) - raw_ctr) > 0.0001:
+        raise SearchConsoleError("Google: CTR не согласуется с кликами и показами")
+    return SearchStats(clicks, impressions, clicks / impressions, float(raw_position))
 
 
 class SearchConsoleClient:
@@ -58,7 +97,7 @@ class SearchConsoleClient:
 
     async def by_landing(self, begin: date, end: date, path: str) -> SearchStats:
         if not self.connected:
-            raise SearchConsoleError("Не настроен Search Console или отсутствует файл ключа")
+            raise SearchConsoleError("Search Console не подключён")
         if path not in ("/mikozacid/", "/hot-ice/"):
             raise ValueError("Unknown landing")
         token = await asyncio.to_thread(self._access_token)
@@ -66,9 +105,9 @@ class SearchConsoleClient:
                quote(self.site_url, safe="") + "/searchAnalytics/query")
         body = {
             "startDate": begin.isoformat(), "endDate": end.isoformat(),
-            "type": "web", "dimensions": [], "rowLimit": 1,
+            "type": "web", "dataState": "final", "dimensions": [], "rowLimit": 1,
             "dimensionFilterGroups": [{"groupType": "and", "filters": [
-                {"dimension": "page", "operator": "contains", "expression": path}
+                {"dimension": "page", "operator": "equals", "expression": "https://zdrava.top" + path}
             ]}],
         }
         try:
@@ -81,9 +120,4 @@ class SearchConsoleClient:
             raise SearchConsoleError(f"Search Console API: HTTP {exc.response.status_code} (проверьте доступ к ресурсу)") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise SearchConsoleError("Сбой связи с Search Console") from exc
-        rows = payload.get("rows", [])
-        if not rows:
-            return SearchStats(0, 0, 0, 0)
-        row = rows[0]
-        return SearchStats(int(row.get("clicks", 0)), int(row.get("impressions", 0)),
-                           float(row.get("ctr", 0)), float(row.get("position", 0)))
+        return parse_search_stats(payload)

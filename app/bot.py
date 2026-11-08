@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -12,10 +14,10 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.config import Config
 from app.services.metrika import LANDINGS, MetrikaClient, MetrikaError
-from app.services.reporting import display_ranked, display_summary, period
+from app.services.reporting import display_ranked, display_summary, period, spend_text, format_money
 from app.services.search_console import SearchConsoleClient, SearchConsoleError
 from app.services.ozon import OZON_ATTRIBUTION_STATUS
-from app.storage import JsonStore
+from app.storage import JsonStore, money_amount, DataIntegrityError
 
 
 def keyboard(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
@@ -116,62 +118,86 @@ class AnalyticsBot:
         stats = []
         for product in LANDINGS:
             stats.append(await self.metrika.totals(begin, end, product))
-        spend = {p: self.store.spend_for(p, begin.isoformat(), end.isoformat()) for p in LANDINGS}
+        spend = {p: self.store.spend_summary(p, begin.isoformat(), end.isoformat()) for p in LANDINGS}
         report = display_summary(begin, end, title, stats, spend)
+        # Persist raw API counts and explicit spending coverage; do not cache missing as zero.
         self.store.write("last_report.json", {
             "period": key, "from": begin.isoformat(), "to": end.isoformat(),
+            "source": "Yandex Metrica", "is_preliminary": key == "today",
             "products": {s.product: {
                 "visits": s.visits, "users": s.users,
                 "ozon_goal_reaches": s.ozon_goal_reaches,
-                "spend_rub_manual": spend[s.product],
+                "spend_rub_manual_recorded": str(spend[s.product].recorded_amount) if spend[s.product].has_data else None,
+                "spend_recorded_days": spend[s.product].recorded_days,
+                "spend_expected_days": spend[s.product].expected_days,
+                "spend_complete": spend[s.product].complete,
             } for s in stats},
         })
         return report
 
     async def expenses(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
-        sums = [(LANDINGS[p][0], self.store.spend_for(p, begin.isoformat(), end.isoformat()))
-                for p in LANDINGS]
+        coverage = {p: self.store.spend_summary(p, begin.isoformat(), end.isoformat()) for p in LANDINGS}
         lines = [f"💵 Реклама — расходы за {title.lower()}",
                  f"{begin:%d.%m.%Y} — {end:%d.%m.%Y}", ""]
-        lines.extend(f"{label}: {cost:,.2f} ₽" for label, cost in sums)
-        lines += [f"Всего: {sum(cost for _, cost in sums):,.2f} ₽", "", "Данные введены вручную, не получены из рекламных API."]
+        for product, item in coverage.items():
+            label = LANDINGS[product][0]
+            if item.complete:
+                lines.append(f"{label}: {item.recorded_amount:,.2f} ₽ — внесено за все {item.expected_days} дн.")
+            elif item.has_data:
+                lines.append(f"{label}: неполные данные ({item.recorded_days}/{item.expected_days} дн.); "
+                             f"внесено {item.recorded_amount:,.2f} ₽, НЕ итог за период")
+            else:
+                lines.append(f"{label}: нет внесённых расходов, сумма неизвестна")
+        if all(item.complete for item in coverage.values()):
+            total = sum((item.recorded_amount for item in coverage.values()), Decimal("0.00"))
+            lines += [f"Итого по двум товарам: {total:,.2f} ₽", ""]
+        else:
+            lines += ["Общий итог не рассчитывается: есть дни без введённых расходов.", ""]
+        lines.append("Ручные записи без привязки к UTM, не данные рекламного API. Ноль учитывается только когда внесён явно.")
         return "\n".join(lines).replace(",", " ")
 
     async def sources(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🌐 Источники — {title}"]
+        if key == "today":
+            parts.append("⚠️ Сегодняшняя статистика предварительная.")
         for product, (label, _) in LANDINGS.items():
-            rows = await self.metrika.sources(begin, end, product)
-            parts.append(display_ranked("\n" + label, rows))
+            ranked = await self.metrika.sources(begin, end, product)
+            parts.append(display_ranked("\n" + label, ranked))
         return "\n".join(parts)
 
     async def utm(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🏷 UTM-источник / кампания — {title}"]
+        if key == "today":
+            parts.append("⚠️ Сегодняшняя статистика предварительная.")
         for product, (label, _) in LANDINGS.items():
-            rows = await self.metrika.utm(begin, end, product)
-            short = [(f"{source} / {campaign}", visits) for source, campaign, visits in rows]
-            parts.append(display_ranked("\n" + label, short))
+            ranked = await self.metrika.utm(begin, end, product)
+            parts.append(display_ranked("\n" + label, ranked))
         parts.append("\nUTM-метки учитываются только если они переданы при посещении сайта.")
         return "\n".join(parts)
 
     async def search(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🔎 Google Search Console — {title}",
-                 "Данные Google обычно поступают с задержкой."]
+                 "Только финализированные данные Google; полноту каждого дня диапазона API не подтверждает."]
         for _, (label, page_url) in LANDINGS.items():
             path = "/" + page_url.split("/", 1)[1]
             stat = await self.gsc.by_landing(begin, end, path)
-            parts += ["", label,
-                      f"Клики: {stat.clicks} | Показы: {stat.impressions}",
-                      f"CTR: {stat.ctr * 100:.2f}% | Средняя позиция: {stat.position:.1f}"]
+            parts += ["", label]
+            if not stat.available:
+                parts.append("Нет подтверждённых данных за этот период (Google не вернул строку). Это НЕ означает 0 кликов или показов.")
+            else:
+                parts.append(f"Клики: {stat.clicks} | Показы: {stat.impressions}")
+                parts.append(f"CTR: {stat.ctr * 100:.2f}%" if stat.ctr is not None else "CTR: не рассчитывается (0 показов)")
+                parts.append(f"Средняя позиция: {stat.position:.1f}" if stat.position is not None else "Средняя позиция: нет данных")
         return "\n".join(parts)
 
     async def check(self) -> str:
         """Real API access check. Never echoes tokens or raw API error bodies."""
         begin, end, _ = period("yesterday", self.config.timezone)
-        parts = ["✅ Проверка подключений"]
+        parts = ["🔎 Результат проверки подключений"]
         try:
             result = await self.metrika.totals(begin, end, "mikozacid")
             parts.append(f"Метрика: доступ есть (Микозацид, визиты вчера: {result.visits})")
@@ -179,8 +205,9 @@ class AnalyticsBot:
             parts.append("Метрика: ошибка — " + str(exc))
         if self.gsc.connected:
             try:
-                await self.gsc.by_landing(begin, end, "/mikozacid/")
-                parts.append("Google Search Console: доступ есть")
+                gsc_result = await self.gsc.by_landing(begin, end, "/mikozacid/")
+                parts.append("Google Search Console: API ответил; " +
+                             ("есть данные" if gsc_result.available else "за период нет строк — 0 не предполагаем"))
             except SearchConsoleError as exc:
                 parts.append("Google Search Console: ошибка — " + str(exc))
         else:
@@ -224,14 +251,14 @@ class AnalyticsBot:
             return "Неизвестный товар. Допустимо: mikozacid или hot_ice."
         try:
             parsed_day = date.fromisoformat(day)
-            amount = float(amount_raw.replace(",", "."))
-            if not (0 <= amount <= 100_000_000) or amount != amount or parsed_day.isoformat() != day:
+            amount = money_amount(amount_raw)
+            if parsed_day.isoformat() != day or parsed_day > datetime.now(ZoneInfo(self.config.timezone)).date():
                 raise ValueError
         except ValueError:
             return "Некорректные дата или сумма. Пример: /spend hot_ice 2026-11-08 500"
         async with self._write_lock:
             self.store.set_spend(product, day, amount)
-        return f"✅ {LANDINGS[product][0]}: {day} — расход {amount:.2f} ₽ сохранён. Это ручной учёт, не данные рекламного API."
+        return f"✅ {LANDINGS[product][0]}: {day} — ручной расход {format_money(amount)} сохранён. Это запись за один день, не полный отчёт и не данные рекламного API."
 
 
 HELP_TEXT = (
@@ -311,7 +338,7 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
             action = "report:" + command
         try:
             await message.answer(await service.handle_action(action), reply_markup=section_for_action(action))
-        except (MetrikaError, SearchConsoleError, ValueError) as exc:
+        except (MetrikaError, SearchConsoleError, DataIntegrityError, ValueError) as exc:
             await message.answer("⚠️ " + str(exc), reply_markup=section_for_action(action))
         except Exception:
             import logging
@@ -347,7 +374,7 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
                 result = await service.handle_action(action)
             if query.message:
                 await query.message.answer(result, reply_markup=section_for_action(action))
-        except (MetrikaError, SearchConsoleError, ValueError) as exc:
+        except (MetrikaError, SearchConsoleError, DataIntegrityError, ValueError) as exc:
             if query.message:
                 await query.message.answer("⚠️ " + str(exc), reply_markup=section_for_action(action))
         except Exception:
@@ -402,7 +429,7 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
         raw = (message.text or "").strip()
         try:
             parsed = date.fromisoformat(raw)
-            if parsed.isoformat() != raw:
+            if parsed.isoformat() != raw or parsed > datetime.now(ZoneInfo(service.config.timezone)).date():
                 raise ValueError
         except ValueError:
             await message.answer("⚠️ Нужна дата ГГГГ-ММ-ДД, например 2026-11-08.", reply_markup=SPEND_CANCEL)
@@ -425,7 +452,7 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
             await state.clear()
             await message.answer(answer, reply_markup=ADS)
         else:
-            await message.answer("⚠️ Некорректная сумма. Введите число от 0 до 100000000 (например, 550,50).", reply_markup=SPEND_CANCEL)
+            await message.answer("⚠️ Нужна сумма 0–100000000 с точностью до копейки, например 550,50. Значения с 3+ знаками не округляются.", reply_markup=SPEND_CANCEL)
 
     @router.message()
     async def fallback(message: Message) -> None:
