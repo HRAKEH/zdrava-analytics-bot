@@ -54,8 +54,6 @@ def display_summary(begin: date, end: date, title: str,
         else:
             lines.append("Цель перехода в Ozon: не настроена, показатель недоступен")
         lines.append("Рекламные расходы: " + spend_text(spend[item.product]))
-        if item.data_lag_seconds is not None and item.data_lag_seconds > 0:
-            lines.append(f"ℹ️ Метрика сообщает о задержке обновления: {item.data_lag_seconds} сек.; свежие данные могут быть неполными.")
     lines += ["", "ℹ️ Визит может включать обе страницы, а цель — происходить в другом месте визита.",
               "Достижения цели ≠ уникальные переходы ≠ заказы. Расходы вручную, без привязки к UTM."]
     return "\n".join(lines)
