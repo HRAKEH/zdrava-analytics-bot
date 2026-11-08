@@ -1,11 +1,13 @@
-"""Telegram menu and commands, accessible only to configured owners."""
+"""Telegram menus and commands for ZDRAVA analytics, accessible only to owners."""
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.config import Config
@@ -16,17 +18,70 @@ from app.services.ozon import OZON_ATTRIBUTION_STATUS
 from app.storage import JsonStore
 
 
-MENU = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📊 Сегодня", callback_data="report:today"),
-     InlineKeyboardButton(text="📊 Вчера", callback_data="report:yesterday")],
-    [InlineKeyboardButton(text="📅 7 дней", callback_data="report:week"),
-     InlineKeyboardButton(text="📅 30 дней", callback_data="report:month")],
-    [InlineKeyboardButton(text="🌐 Источники", callback_data="sources:week"),
-     InlineKeyboardButton(text="🏷 UTM", callback_data="utm:week")],
-    [InlineKeyboardButton(text="🔎 Google", callback_data="search:week"),
-     InlineKeyboardButton(text="⚙️ Статус", callback_data="status")],
-    [InlineKeyboardButton(text="✅ Проверить API", callback_data="check")],
-])
+def keyboard(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=title, callback_data=callback) for title, callback in row]
+        for row in rows
+    ])
+
+
+HOME = keyboard(
+    (("📊 Трафик", "nav:traffic"), ("📣 Реклама", "nav:ads")),
+    (("🔎 SEO / Google", "nav:seo"), ("⚙️ Система", "nav:system")),
+    (("❔ Помощь", "help"),),
+)
+TRAFFIC = keyboard(
+    (("Сегодня", "report:today"), ("Вчера", "report:yesterday")),
+    (("7 дней", "report:week"), ("30 дней", "report:month")),
+    (("🌐 Источники", "sources:week"), ("🏷 UTM-метки", "utm:week")),
+    (("🏠 Главное меню", "nav:home"),),
+)
+ADS = keyboard(
+    (("💰 Добавить расход", "spend:start"),),
+    (("💵 Расходы 7 дней", "expenses:week"), ("💵 30 дней", "expenses:month")),
+    (("🏷 UTM-кампании", "utm:week"), ("🌐 Источники", "sources:week")),
+    (("🛒 Ozon: статус", "ozon"),),
+    (("🏠 Главное меню", "nav:home"),),
+)
+SEO = keyboard(
+    (("🔎 Поиск Google · 7 дней", "search:week"),),
+    (("🏠 Главное меню", "nav:home"),),
+)
+SYSTEM = keyboard(
+    (("⚙️ Подключения", "status"), ("✅ Проверить API", "check")),
+    (("🪪 Мой Telegram ID", "id"), ("❔ Помощь", "help")),
+    (("🏠 Главное меню", "nav:home"),),
+)
+SPEND_PRODUCTS = keyboard(
+    (("🧴 Микозацид", "spend:product:mikozacid"),),
+    (("🔥 Горячий лёд", "spend:product:hot_ice"),),
+    (("⬅️ К рекламе", "nav:ads"),),
+)
+SPEND_DATES = keyboard(
+    (("Сегодня", "spend:date:today"), ("Вчера", "spend:date:yesterday")),
+    (("📆 Другая дата", "spend:date:custom"),),
+    (("⬅️ К товарам", "spend:start"), ("✖️ Отмена", "spend:cancel")),
+)
+SPEND_CANCEL = keyboard((("✖️ Отмена", "spend:cancel"),))
+
+SECTIONS = {
+    "home": ("ЗДРАВА | Аналитика\nВыберите раздел:", HOME),
+    "traffic": ("📊 Трафик\nПосещения, периоды, источники и UTM:", TRAFFIC),
+    "ads": ("📣 Реклама\nРучной учёт расходов и результаты переходов:", ADS),
+    "seo": ("🔎 SEO / Google\nПоисковая статистика двух лендингов:", SEO),
+    "system": ("⚙️ Система\nПодключения и диагностика:", SYSTEM),
+}
+
+ACTIONS = frozenset({
+    "report:today", "report:yesterday", "report:week", "report:month",
+    "sources:week", "utm:week", "search:week", "expenses:week", "expenses:month",
+    "ozon", "status", "check", "id", "help",
+})
+
+
+class SpendFlow(StatesGroup):
+    custom_date = State()
+    amount = State()
 
 
 class AnalyticsBot:
@@ -63,7 +118,6 @@ class AnalyticsBot:
             stats.append(await self.metrika.totals(begin, end, product))
         spend = {p: self.store.spend_for(p, begin.isoformat(), end.isoformat()) for p in LANDINGS}
         report = display_summary(begin, end, title, stats, spend)
-        # Snapshot contains only aggregated data, never OAuth tokens or visitor IDs.
         self.store.write("last_report.json", {
             "period": key, "from": begin.isoformat(), "to": end.isoformat(),
             "products": {s.product: {
@@ -73,6 +127,16 @@ class AnalyticsBot:
             } for s in stats},
         })
         return report
+
+    async def expenses(self, key: str) -> str:
+        begin, end, title = period(key, self.config.timezone)
+        sums = [(LANDINGS[p][0], self.store.spend_for(p, begin.isoformat(), end.isoformat()))
+                for p in LANDINGS]
+        lines = [f"💵 Реклама — расходы за {title.lower()}",
+                 f"{begin:%d.%m.%Y} — {end:%d.%m.%Y}", ""]
+        lines.extend(f"{label}: {cost:,.2f} ₽" for label, cost in sums)
+        lines += [f"Всего: {sum(cost for _, cost in sums):,.2f} ₽", "", "Данные введены вручную, не получены из рекламных API."]
+        return "\n".join(lines).replace(",", " ")
 
     async def sources(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
@@ -133,8 +197,16 @@ class AnalyticsBot:
             return await self.check()
         if name == "status":
             return self.status()
+        if name == "id":
+            raise ValueError("Telegram ID handled separately")
+        if name == "help":
+            return HELP_TEXT
+        if name == "ozon":
+            return "🛒 Ozon\n" + OZON_ATTRIBUTION_STATUS + "\n\nПереходы на Ozon отражаются в отчётах Метрики только при заданной цели METRIKA_OZON_GOAL_ID. Переход не равен покупке."
         if name.startswith("report:"):
             return await self.report(name.partition(":")[2])
+        if name.startswith("expenses:"):
+            return await self.expenses(name.partition(":")[2])
         if name.startswith("sources:"):
             return await self.sources(name.partition(":")[2])
         if name.startswith("utm:"):
@@ -162,72 +234,203 @@ class AnalyticsBot:
         return f"✅ {LANDINGS[product][0]}: {day} — расход {amount:.2f} ₽ сохранён. Это ручной учёт, не данные рекламного API."
 
 
+HELP_TEXT = (
+    "❔ ЗДРАВА | Аналитика\n"
+    "Выберите тематический раздел в /start. Все функции доступны кнопками.\n\n"
+    "📊 Трафик — сегодня, вчера, 7/30 дней, источники и UTM.\n"
+    "📣 Реклама — внесение расходов по товару, суммы за период, UTM и статус Ozon.\n"
+    "🔎 SEO — Google Search Console.\n"
+    "⚙️ Система — настройки, реальная проверка API, ваш ID.\n\n"
+    "Команды также доступны вручную: /today /yesterday /week /month "
+    "/sources /utm /search /status /check /id /spend /cancel.\n"
+    "Ограничение: переходы на маркетплейс не доказывают продажи."
+)
+
+
+def section_for_action(action: str) -> InlineKeyboardMarkup:
+    if action.startswith("report:") or action.startswith("sources:"):
+        return TRAFFIC
+    if action.startswith("expenses:") or action in {"ozon", "utm:week"}:
+        return ADS
+    if action.startswith("search:"):
+        return SEO
+    return SYSTEM
+
+
 def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
     router = Router()
     dp = Dispatcher()
 
+    def user_allowed(user) -> bool:
+        return service.allowed(user.id if user else None)
+
     @router.message(Command("id"))
     async def get_id(message: Message) -> None:
         uid = message.from_user.id if message.from_user else None
-        await message.answer(f"Ваш Telegram ID: {uid}\nДобавьте его в TELEGRAM_OWNER_IDS на Bothost.")
+        await message.answer(f"Ваш Telegram ID: {uid}\nДобавьте его в TELEGRAM_OWNER_IDS на Bothost.", reply_markup=SYSTEM if service.allowed(uid) else None)
 
     @router.message(CommandStart())
-    async def start(message: Message) -> None:
-        if not service.allowed(message.from_user.id if message.from_user else None):
+    async def start(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        if not user_allowed(message.from_user):
             await message.answer("Доступ закрыт. Узнать свой ID: /id")
             return
-        await message.answer("ЗДРАВА | Аналитика\nДва лендинга, один отчёт. Выберите действие:", reply_markup=MENU)
+        text, markup = SECTIONS["home"]
+        await message.answer(text, reply_markup=markup)
+
+    @router.message(Command("cancel"))
+    async def cancel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        if user_allowed(message.from_user):
+            await message.answer("Действие отменено.", reply_markup=HOME)
 
     @router.message(Command("help"))
     async def help_cmd(message: Message) -> None:
-        if not service.allowed(message.from_user.id if message.from_user else None):
-            return
-        await message.answer("/start — меню\n/today, /yesterday, /week, /month — Метрика\n/sources, /utm — источники и UTM за 7 дней\n/search — Google за 7 дней\n/status — настройки\n/check — реальная проверка API и записи JSON\n/spend <mikozacid|hot_ice> <YYYY-MM-DD> <сумма> — записать рекламный расход за дату\n/id — ваш Telegram ID")
+        if user_allowed(message.from_user):
+            await message.answer(HELP_TEXT, reply_markup=SYSTEM)
 
     @router.message(Command("spend"))
-    async def spend(message: Message) -> None:
-        if not service.allowed(message.from_user.id if message.from_user else None):
+    async def spend(message: Message, state: FSMContext) -> None:
+        if not user_allowed(message.from_user):
             return
-        await message.answer(await service.set_spend(message.text or ""))
+        if len((message.text or "").strip().split()) > 1:
+            await state.clear()
+            await message.answer(await service.set_spend(message.text or ""), reply_markup=ADS)
+        else:
+            await state.clear()
+            await message.answer("💰 Выберите товар, для которого вносите расход:", reply_markup=SPEND_PRODUCTS)
 
     @router.message(Command("today", "yesterday", "week", "month", "sources", "utm", "search", "status", "check"))
-    async def other(message: Message) -> None:
-        if not service.allowed(message.from_user.id if message.from_user else None):
+    async def other(message: Message, state: FSMContext) -> None:
+        if not user_allowed(message.from_user):
             return
+        await state.clear()
         command = (message.text or "").split()[0].split("@")[0].lstrip("/")
         action = command if command in ("status", "check") else command + (":week" if command in ("sources", "utm", "search") else "")
         if command in ("today", "yesterday", "week", "month"):
             action = "report:" + command
         try:
-            await message.answer(await service.handle_action(action), reply_markup=MENU)
+            await message.answer(await service.handle_action(action), reply_markup=section_for_action(action))
         except (MetrikaError, SearchConsoleError, ValueError) as exc:
-            await message.answer("⚠️ " + str(exc), reply_markup=MENU)
+            await message.answer("⚠️ " + str(exc), reply_markup=section_for_action(action))
         except Exception:
             import logging
             logging.exception("Failed report")
-            await message.answer("⚠️ Внутренняя ошибка отчёта. Проверьте журнал Bothost.")
+            await message.answer("⚠️ Внутренняя ошибка отчёта. Проверьте журнал Bothost.", reply_markup=HOME)
 
-    @router.callback_query(F.data.in_({
-        "report:today", "report:yesterday", "report:week", "report:month",
-        "sources:week", "utm:week", "search:week", "status", "check",
-    }))
-    async def inline(query: CallbackQuery) -> None:
-        if not service.allowed(query.from_user.id if query.from_user else None):
+    @router.callback_query(F.data.startswith("nav:"))
+    async def navigation(query: CallbackQuery, state: FSMContext) -> None:
+        if not user_allowed(query.from_user):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+        key = (query.data or "").partition(":")[2]
+        await query.answer()
+        if key not in SECTIONS:
+            return
+        await state.clear()
+        if query.message:
+            title, markup = SECTIONS[key]
+            await query.message.edit_text(title, reply_markup=markup)
+
+    @router.callback_query(F.data.in_(ACTIONS))
+    async def actions(query: CallbackQuery, state: FSMContext) -> None:
+        if not user_allowed(query.from_user):
             await query.answer("Нет доступа", show_alert=True)
             return
         await query.answer()
+        await state.clear()
+        action = query.data or ""
         try:
-            response = await service.handle_action(query.data or "")
+            if action == "id":
+                result = f"🪪 Ваш Telegram ID: {query.from_user.id}"
+            else:
+                result = await service.handle_action(action)
             if query.message:
-                await query.message.answer(response, reply_markup=MENU)
+                await query.message.answer(result, reply_markup=section_for_action(action))
         except (MetrikaError, SearchConsoleError, ValueError) as exc:
             if query.message:
-                await query.message.answer("⚠️ " + str(exc), reply_markup=MENU)
+                await query.message.answer("⚠️ " + str(exc), reply_markup=section_for_action(action))
         except Exception:
             import logging
             logging.exception("Failed callback report")
             if query.message:
-                await query.message.answer("⚠️ Внутренняя ошибка отчёта. Проверьте журнал Bothost.")
+                await query.message.answer("⚠️ Внутренняя ошибка отчёта. Проверьте журнал Bothost.", reply_markup=HOME)
+
+    @router.callback_query(F.data.startswith("spend:"))
+    async def spend_buttons(query: CallbackQuery, state: FSMContext) -> None:
+        if not user_allowed(query.from_user):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+        await query.answer()
+        action = query.data or ""
+        if not query.message:
+            return
+        if action == "spend:cancel":
+            await state.clear()
+            await query.message.edit_text("Ввод расходов отменён.", reply_markup=ADS)
+        elif action == "spend:start":
+            await state.clear()
+            await query.message.edit_text("💰 Выберите товар, для которого вносите расход:", reply_markup=SPEND_PRODUCTS)
+        elif action in {"spend:product:mikozacid", "spend:product:hot_ice"}:
+            product = action.removeprefix("spend:product:")
+            await state.clear()
+            await state.update_data(product=product)
+            await query.message.edit_text(f"💰 {LANDINGS[product][0]}\nВыберите дату расхода:", reply_markup=SPEND_DATES)
+        elif action in {"spend:date:today", "spend:date:yesterday", "spend:date:custom"}:
+            saved = await state.get_data()
+            if saved.get("product") not in LANDINGS:
+                await state.clear()
+                await query.message.edit_text("Выберите товар сначала:", reply_markup=SPEND_PRODUCTS)
+                return
+            chosen = action.removeprefix("spend:date:")
+            if chosen == "custom":
+                await state.set_state(SpendFlow.custom_date)
+                await query.message.answer("📆 Пришлите дату в формате ГГГГ-ММ-ДД (например, 2026-11-08).", reply_markup=SPEND_CANCEL)
+                return
+            # The report's configured timezone, not the host's timezone, defines a day.
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo(service.config.timezone)).date()
+            day = (today - timedelta(days=int(chosen == "yesterday"))).isoformat()
+            await state.update_data(day=day)
+            await state.set_state(SpendFlow.amount)
+            await query.message.answer(f"💰 {LANDINGS[saved['product']][0]} · {day}\nПришлите сумму расхода в рублях (например, 500 или 500,50).", reply_markup=SPEND_CANCEL)
+
+    @router.message(SpendFlow.custom_date)
+    async def manual_date(message: Message, state: FSMContext) -> None:
+        if not user_allowed(message.from_user):
+            return
+        raw = (message.text or "").strip()
+        try:
+            parsed = date.fromisoformat(raw)
+            if parsed.isoformat() != raw:
+                raise ValueError
+        except ValueError:
+            await message.answer("⚠️ Нужна дата ГГГГ-ММ-ДД, например 2026-11-08.", reply_markup=SPEND_CANCEL)
+            return
+        await state.update_data(day=raw)
+        await state.set_state(SpendFlow.amount)
+        await message.answer("💰 Введите сумму рекламного расхода в рублях:", reply_markup=SPEND_CANCEL)
+
+    @router.message(SpendFlow.amount)
+    async def manual_amount(message: Message, state: FSMContext) -> None:
+        if not user_allowed(message.from_user):
+            return
+        data = await state.get_data()
+        if data.get("product") not in LANDINGS or not data.get("day"):
+            await state.clear()
+            await message.answer("Данные не найдены. Начните ввод заново.", reply_markup=ADS)
+            return
+        answer = await service.set_spend(f"/spend {data['product']} {data['day']} {(message.text or '').strip()}")
+        if answer.startswith("✅"):
+            await state.clear()
+            await message.answer(answer, reply_markup=ADS)
+        else:
+            await message.answer("⚠️ Некорректная сумма. Введите число от 0 до 100000000 (например, 550,50).", reply_markup=SPEND_CANCEL)
+
+    @router.message()
+    async def fallback(message: Message) -> None:
+        if user_allowed(message.from_user):
+            await message.answer("Выберите нужный раздел кнопкой:", reply_markup=HOME)
 
     dp.include_router(router)
     return dp

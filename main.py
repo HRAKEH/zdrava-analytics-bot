@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from aiogram import Bot
+from aiogram.types import BotCommand
 
 from app.bot import AnalyticsBot, build_dispatcher
 from app.config import Config
@@ -54,6 +55,22 @@ async def main() -> None:
     service = AnalyticsBot(config, store)
     bot = Bot(token=config.telegram_token)
     dp = build_dispatcher(service)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="today", description="📊 Трафик сегодня"),
+        BotCommand(command="yesterday", description="📊 Трафик вчера"),
+        BotCommand(command="week", description="📅 Трафик за 7 дней"),
+        BotCommand(command="month", description="📅 Трафик за 30 дней"),
+        BotCommand(command="sources", description="🌐 Источники"),
+        BotCommand(command="utm", description="🏷 UTM-кампании"),
+        BotCommand(command="spend", description="💰 Добавить расход"),
+        BotCommand(command="search", description="🔎 Google Search Console"),
+        BotCommand(command="status", description="⚙️ Подключения"),
+        BotCommand(command="check", description="✅ Проверить API"),
+        BotCommand(command="id", description="🪪 Мой Telegram ID"),
+        BotCommand(command="help", description="❔ Помощь"),
+        BotCommand(command="cancel", description="✖️ Отменить ввод"),
+    ])
     daily = asyncio.create_task(daily_loop(bot, service), name="daily-report")
     log.info("ZDRAVA analytics started; authorized owners=%s; data=%s", len(config.owner_ids), config.data_dir)
     try:
