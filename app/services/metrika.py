@@ -132,6 +132,8 @@ class MetrikaClient:
 
     @staticmethod
     def _ranked(raw: dict[str, Any], dimension_count: int) -> RankedResult:
+        if raw.get("contains_sensitive_data") is True:
+            raise MetrikaError("Метрика может скрывать часть строк; список неполный")
         total = raw.get("total_rows")
         if total is None or raw.get("total_rows_rounded") is True:
             raise MetrikaError("Метрика: число строк неизвестно или округлено; список скрыт")

@@ -160,6 +160,8 @@ class AnalyticsBot:
     async def sources(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🌐 Источники — {title}"]
+        if key == "today":
+            parts.append("⚠️ Сегодняшняя статистика предварительная.")
         for product, (label, _) in LANDINGS.items():
             ranked = await self.metrika.sources(begin, end, product)
             parts.append(display_ranked("\n" + label, ranked))
@@ -168,6 +170,8 @@ class AnalyticsBot:
     async def utm(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🏷 UTM-источник / кампания — {title}"]
+        if key == "today":
+            parts.append("⚠️ Сегодняшняя статистика предварительная.")
         for product, (label, _) in LANDINGS.items():
             ranked = await self.metrika.utm(begin, end, product)
             parts.append(display_ranked("\n" + label, ranked))
@@ -177,7 +181,7 @@ class AnalyticsBot:
     async def search(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
         parts = [f"🔎 Google Search Console — {title}",
-                 "Данные Google обычно поступают с задержкой."]
+                 "Только финализированные данные Google; полноту каждого дня диапазона API не подтверждает."]
         for _, (label, page_url) in LANDINGS.items():
             path = "/" + page_url.split("/", 1)[1]
             stat = await self.gsc.by_landing(begin, end, path)
@@ -193,7 +197,7 @@ class AnalyticsBot:
     async def check(self) -> str:
         """Real API access check. Never echoes tokens or raw API error bodies."""
         begin, end, _ = period("yesterday", self.config.timezone)
-        parts = ["✅ Проверка подключений"]
+        parts = ["🔎 Результат проверки подключений"]
         try:
             result = await self.metrika.totals(begin, end, "mikozacid")
             parts.append(f"Метрика: доступ есть (Микозацид, визиты вчера: {result.visits})")
