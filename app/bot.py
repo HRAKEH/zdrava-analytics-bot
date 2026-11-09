@@ -227,6 +227,7 @@ class AnalyticsBot:
         except MetrikaError as exc:
             parts.append("Метрика: ошибка — " + str(exc))
         if self.gsc.connected:
+            parts.append("Google: проверка ключа в Bothost — " + self.gsc.credential_check())
             try:
                 gsc_result = await self.gsc.by_landing(begin, end, "/mikozacid/")
                 parts.append("Google Search Console: API ответил; " +

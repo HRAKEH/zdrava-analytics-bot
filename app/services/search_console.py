@@ -97,6 +97,39 @@ class SearchConsoleClient:
     def connected(self) -> bool:
         return bool(self.site_url and (self.service_account_b64 or self.credentials_path.is_file()))
 
+    def credential_check(self) -> str:
+        """Non-secret diagnostics for Bothost's actual environment value.
+
+        No credential content, prefix, hash, e-mail, or file contents are echoed.
+        """
+        if self.service_account_b64:
+            encoded = self.service_account_b64
+            label = f"Base64, {len(encoded)} символов"
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return f"{label} — формат Base64 НЕВЕРНЫЙ"
+            try:
+                info = json.loads(payload.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                return f"{label} — Base64 верный, JSON НЕВЕРНЫЙ"
+            if not isinstance(info, dict) or info.get("type") != "service_account":
+                return f"{label} — JSON не является ключом service_account"
+            if not all(isinstance(info.get(field), str) and info[field]
+                       for field in ("client_email", "private_key", "token_uri")):
+                return f"{label} — отсутствуют обязательные поля ключа"
+            try:
+                from google.oauth2 import service_account
+                service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+            except (ValueError, KeyError, TypeError):
+                return f"{label} — приватный ключ не читается"
+            except ImportError:
+                return f"{label} — библиотека google-auth не установлена"
+            return f"{label} — JSON и приватный ключ локально корректны"
+        if self.credentials_path.is_file():
+            return "используется JSON-файл с диска, переменная Base64 пуста"
+        return "ключ отсутствует: переменная Base64 пуста и файл не найден"
+
     def _access_token(self) -> str:
         try:
             from google.oauth2 import service_account
