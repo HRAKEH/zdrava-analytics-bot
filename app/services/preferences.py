@@ -12,6 +12,7 @@ PREF_TYPES = {
     "backup_enabled": bool, "backup_time": str,
     "backup_send_telegram": bool,
     "retention_days": int, "backup_max_count": int,
+    "backup_max_total_mb": int,
 }
 TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
@@ -31,6 +32,8 @@ class Preferences:
             raise ValueError("Срок хранения — от 1 до 365 дней")
         if name == "backup_max_count" and not 1 <= value <= 100:
             raise ValueError("Количество архивов — от 1 до 100")
+        if name == "backup_max_total_mb" and not 1 <= value <= 2048:
+            raise ValueError("Размер архивов — от 1 до 2048 МБ")
 
     def get(self) -> dict[str, Any]:
         raw = self.store.read("user_settings.json", {})

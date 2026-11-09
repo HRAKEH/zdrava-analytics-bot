@@ -22,6 +22,7 @@ async def backup_loop(bot, service) -> None:
             options = service.preferences.get()
             service.backups.retention_days = options["retention_days"]
             service.backups.max_count = options["backup_max_count"]
+            service.backups.max_total_bytes = options["backup_max_total_mb"] * 1024 * 1024
             hour_key = now.strftime("%Y-%m-%d %H")
             if hour_key != last_prune_hour:
                 await asyncio.to_thread(service.backups.prune)

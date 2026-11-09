@@ -115,6 +115,19 @@ class JsonStore:
         data.setdefault(product, {})[day] = f"{amount:.2f}"
         self.write("ad_spend.json", data)
 
+    def delete_spend(self, product: str, day: str) -> bool:
+        """Delete an existing manual entry, never replace it with fake zero."""
+        if product not in ("mikozacid", "hot_ice") or date.fromisoformat(day).isoformat() != day:
+            raise ValueError("Invalid product or date")
+        data = self._spend_data()
+        if day not in data.get(product, {}):
+            return False
+        del data[product][day]
+        if not data[product]:
+            del data[product]
+        self.write("ad_spend.json", data)
+        return True
+
     def spend_summary(self, product: str, begin: str, end: str) -> SpendCoverage:
         data = self._spend_data()
         start = date.fromisoformat(begin)

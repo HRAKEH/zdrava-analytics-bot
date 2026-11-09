@@ -68,6 +68,7 @@ async def main() -> None:
         BotCommand(command="sources", description="🌐 Источники"),
         BotCommand(command="utm", description="🏷 UTM-кампании"),
         BotCommand(command="spend", description="💰 Добавить расход"),
+        BotCommand(command="spend_remove", description="🗑 Удалить запись расхода"),
         BotCommand(command="direct", description="📣 Яндекс Директ"),
         BotCommand(command="settings", description="✏️ Настройки бота"),
         BotCommand(command="search", description="🔎 Google Search Console"),

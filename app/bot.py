@@ -46,7 +46,8 @@ TRAFFIC = keyboard(
     (("🏠 Главное меню", "nav:home"),),
 )
 ADS = keyboard(
-    (("💰 Добавить расход", "spend:start"),),
+    (("💰 Добавить / исправить расход", "spend:start"),),
+    (("🗑 Удалить ошибочную запись", "spend_remove:start"),),
     (("💵 Расходы 7 дней", "expenses:week"), ("💵 30 дней", "expenses:month")),
     (("🏷 UTM-кампании", "utm:week"), ("🌐 Источники", "sources:week")),
     (("📣 Яндекс Директ", "direct:home"),),
@@ -124,6 +125,7 @@ class AnalyticsBot:
             "backup_send_telegram": self.backup_options.send_telegram,
             "retention_days": self.backup_options.retention_days,
             "backup_max_count": self.backup_options.max_count,
+            "backup_max_total_mb": self.backup_options.max_total_mb,
         })
         self.direct = DirectClient(os.getenv("YANDEX_DIRECT_TOKEN", ""),
             os.getenv("YANDEX_DIRECT_CLIENT_LOGIN", ""), timeout=config.http_timeout)

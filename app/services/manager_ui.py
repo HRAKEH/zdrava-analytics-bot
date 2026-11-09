@@ -1,7 +1,8 @@
 """Owner-only Telegram control panel for safe settings and Yandex Direct campaign attribution."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 from aiogram import F, Router
@@ -21,11 +22,15 @@ SETTINGS_LABELS = {
     "backup_time": "Время создания архива",
     "retention_days": "Срок хранения архивов в днях",
     "backup_max_count": "Максимум архивов",
+    "backup_max_total_mb": "Общий лимит ZIP в МБ",
 }
 EDITABLE = frozenset(SETTINGS_LABELS)
 
 class SettingsFlow(StatesGroup):
     value = State()
+
+class DeleteSpendFlow(StatesGroup):
+    day = State()
 
 def kb(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -43,6 +48,7 @@ def settings_kb(p: dict) -> InlineKeyboardMarkup:
         ((f"📤 ZIP в Telegram {toggle('backup_send_telegram')}", "prefs:toggle:backup_send_telegram"),),
         ((f"🗓 Хранить {p['retention_days']} дн.", "prefs:input:retention_days"),
          (f"📦 Макс. {p['backup_max_count']} архивов", "prefs:input:backup_max_count")),
+        ((f"💽 Лимит {p['backup_max_total_mb']} МБ", "prefs:input:backup_max_total_mb"),),
         (("⬅️ Система", "nav:system"),),
     )
 
@@ -62,7 +68,7 @@ def settings_text(p: dict) -> str:
         f"📬 Ежедневная сводка: {'включена' if p['daily_enabled'] else 'выключена'} · {p['daily_time']}\n"
         f"💾 Автоматическая копия: {'включена' if p['backup_enabled'] else 'выключена'} · {p['backup_time']}\n"
         f"📤 Автоматически присылать ZIP: {'да' if p['backup_send_telegram'] else 'нет'}\n"
-        f"🗓 Срок хранения: {p['retention_days']} дн. · максимум {p['backup_max_count']} шт.\n\n"
+        f"🗓 Срок хранения: {p['retention_days']} дн. · максимум {p['backup_max_count']} шт. · {p['backup_max_total_mb']} МБ\n\n"
         "Время по Москве. Нажмите кнопку, чтобы изменить настройку.\n"
         "🔒 Токены и пароли меняются только в защищённых переменных Bothost."
     )
@@ -151,6 +157,88 @@ def register_manager_handlers(router: Router, service) -> None:
         await message.answer("📣 Яндекс Директ\nСписок кампаний и расходы по двум товарам.",
                              reply_markup=DIRECT_MENU)
 
+
+    @router.message(Command("spend_remove"))
+    async def spend_remove_command(message: Message, state: FSMContext):
+        if not owner(message.from_user): return
+        await state.clear()
+        await message.answer("🗑 Удаление ошибочной записи расхода\nВыберите товар:",
+            reply_markup=kb(
+                (("🧴 Микозацид", "spend_remove:choose:mikozacid"),),
+                (("🔥 Горячий лёд", "spend_remove:choose:hot_ice"),),
+                (("✖️ Отмена", "spend_remove:cancel"),),
+            ))
+
+    @router.callback_query(F.data.startswith("spend_remove:"))
+    async def spend_remove_callback(query: CallbackQuery, state: FSMContext):
+        if not owner(query.from_user):
+            await query.answer("Нет доступа", show_alert=True); return
+        await query.answer()
+        if not isinstance(query.message, Message): return
+        action = (query.data or "").split(":")
+        if len(action) == 2 and action[1] in ("start", "cancel"):
+            await state.clear()
+            if action[1] == "start":
+                await query.message.answer("🗑 Какой товар?",
+                    reply_markup=kb(
+                        (("🧴 Микозацид", "spend_remove:choose:mikozacid"),),
+                        (("🔥 Горячий лёд", "spend_remove:choose:hot_ice"),),
+                        (("✖️ Отмена", "spend_remove:cancel"),),
+                    ))
+            else:
+                await query.message.answer("Удаление отменено.")
+        elif len(action) == 3 and action[1] == "choose" and action[2] in LABELS:
+            await state.clear()
+            await state.set_state(DeleteSpendFlow.day)
+            await state.update_data(product=action[2])
+            await query.message.answer(f"🗑 {LABELS[action[2]]}\n"
+                "Укажите дату ошибочной записи в формате ГГГГ-ММ-ДД.\n"
+                "Данные будут удалены только после подтверждения.",
+                reply_markup=kb((("✖️ Отмена", "spend_remove:cancel"),)))
+        elif len(action) == 4 and action[1] == "confirm" and action[2] in LABELS:
+            product, raw_date = action[2], action[3]
+            saved = await state.get_data()
+            if saved.get("delete") != (product, raw_date):
+                await state.clear()
+                await query.message.answer("Подтверждение устарело. Начните удаление заново.")
+                return
+            await state.clear()
+            try:
+                removed = service.store.delete_spend(product, raw_date)
+                await query.message.answer("✅ Запись удалена." if removed else
+                    "Такой записи расходов нет. Другие данные не затронуты.")
+            except DataIntegrityError:
+                await query.message.answer("⚠️ Данные расходов повреждены. Удаление остановлено.")
+
+    @router.message(DeleteSpendFlow.day)
+    async def spend_remove_date(message: Message, state: FSMContext):
+        if not owner(message.from_user): return
+        saved = await state.get_data()
+        product = saved.get("product")
+        value = (message.text or "").strip()
+        try:
+            day = date.fromisoformat(value)
+            if product not in LABELS or day.isoformat() != value or day > datetime.now(
+                    ZoneInfo(service.config.timezone)).date():
+                raise ValueError
+            entries = service.store._spend_data()
+            recorded = entries.get(product, {}).get(value)
+            if recorded is None:
+                await state.clear()
+                await message.answer("За эту дату ручных расходов не найдено. Ничего не удалено.")
+                return
+            await state.update_data(delete=(product, value))
+            await message.answer(
+                f"⚠️ Удалить запись?\n{LABELS[product]}\nДата: {value}\nСумма: {recorded} ₽\n"
+                "Это не то же самое, что установить 0 ₽.",
+                reply_markup=kb(
+                    (("🗑 Да, удалить", f"spend_remove:confirm:{product}:{value}"),),
+                    (("✖️ Отмена", "spend_remove:cancel"),),
+                ))
+        except (ValueError, DataIntegrityError):
+            await message.answer("⚠️ Введите дату в формате ГГГГ-ММ-ДД.",
+                reply_markup=kb((("✖️ Отмена", "spend_remove:cancel"),)))
+
     @router.callback_query(F.data.startswith("prefs:"))
     async def prefs_callback(query: CallbackQuery, state: FSMContext):
         if not owner(query.from_user):
@@ -197,7 +285,7 @@ def register_manager_handlers(router: Router, service) -> None:
             await message.answer("Настройка не выбрана. Откройте /settings."); return
         value = (message.text or "").strip()
         try:
-            if name in ("retention_days", "backup_max_count"):
+            if name in ("retention_days", "backup_max_count", "backup_max_total_mb"):
                 if not value.isdecimal(): raise ValueError("Введите целое положительное число")
                 parsed = int(value)
             else:
