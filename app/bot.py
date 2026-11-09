@@ -18,6 +18,9 @@ from app.services.reporting import display_ranked, display_summary, period, spen
 from app.services.search_console import SearchConsoleClient, SearchConsoleError
 from app.services.ozon import OZON_ATTRIBUTION_STATUS
 from app.storage import JsonStore, money_amount, DataIntegrityError
+from app.services.backups import BackupService, BackupOptions
+from app.services.backup_handlers import register_backup_handlers
+from app.services.daily_digest import compact_daily_digest
 
 
 def keyboard(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
@@ -51,8 +54,14 @@ SEO = keyboard(
 )
 SYSTEM = keyboard(
     (("⚙️ Подключения", "status"), ("✅ Проверить API", "check")),
+    (("🗄 Резервные копии", "nav:backups"),),
     (("🪪 Мой Telegram ID", "id"), ("❔ Помощь", "help")),
     (("🏠 Главное меню", "nav:home"),),
+)
+BACKUPS = keyboard(
+    (("💾 Создать ZIP", "backup:manual"), ("📤 Скачать последний", "backup:latest")),
+    (("📚 Список архивов", "backup:list"), ("🧹 Очистить старые", "backup:prune")),
+    (("⬅️ В систему", "nav:system"),),
 )
 SPEND_PRODUCTS = keyboard(
     (("🧴 Микозацид", "spend:product:mikozacid"),),
@@ -72,6 +81,7 @@ SECTIONS = {
     "ads": ("📣 Реклама\nРучной учёт расходов и результаты переходов:", ADS),
     "seo": ("🔎 SEO / Google\nПоисковая статистика двух лендингов:", SEO),
     "system": ("⚙️ Система\nПодключения и диагностика:", SYSTEM),
+    "backups": ("🗄 Резервные копии\nАрхивы JSON в /app/data/backups:", BACKUPS),
 }
 
 ACTIONS = frozenset({
@@ -96,6 +106,11 @@ class AnalyticsBot:
             config.gsc_service_account_file, timeout=config.http_timeout,
             service_account_b64=config.gsc_service_account_b64)
         self._write_lock = asyncio.Lock()
+        self.backup_options = BackupOptions.from_env()
+        self.backups = BackupService(config.data_dir,
+            retention_days=self.backup_options.retention_days,
+            max_count=self.backup_options.max_count,
+            max_total_mb=self.backup_options.max_total_mb)
 
     def allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.config.owner_ids
@@ -134,6 +149,14 @@ class AnalyticsBot:
             } for s in stats},
         })
         return report
+
+    async def daily_digest(self) -> str:
+        """Short daily push; complete reports remain available via Traffic menu."""
+        begin, end, _ = period("yesterday", self.config.timezone)
+        stats = [await self.metrika.totals(begin, end, product) for product in LANDINGS]
+        spend = {p: self.store.spend_summary(p, begin.isoformat(), end.isoformat()) for p in LANDINGS}
+        return compact_daily_digest(end, stats, spend,
+            {name: info[0] for name, info in LANDINGS.items()})
 
     async def expenses(self, key: str) -> str:
         begin, end, title = period(key, self.config.timezone)
@@ -267,9 +290,10 @@ HELP_TEXT = (
     "📊 Трафик — сегодня, вчера, 7/30 дней, источники и UTM.\n"
     "📣 Реклама — внесение расходов по товару, суммы за период, UTM и статус Ozon.\n"
     "🔎 SEO — Google Search Console.\n"
-    "⚙️ Система — настройки, реальная проверка API, ваш ID.\n\n"
+    "⚙️ Система — настройки, проверка API, архивы ZIP, ваш ID.\n\n"
     "Команды также доступны вручную: /today /yesterday /week /month "
-    "/sources /utm /search /status /check /id /spend /cancel.\n"
+    "/sources /utm /search /status /check /id /spend /cancel "
+    "/backup /backups /backup_latest /backup_cleanup.\n"
     "Ограничение: переходы на маркетплейс не доказывают продажи."
 )
 
@@ -459,5 +483,6 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
         if user_allowed(message.from_user):
             await message.answer("Выберите нужный раздел кнопкой:", reply_markup=HOME)
 
+    register_backup_handlers(router, service, BACKUPS)
     dp.include_router(router)
     return dp

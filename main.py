@@ -13,6 +13,7 @@ from aiogram.types import BotCommand
 from app.bot import AnalyticsBot, build_dispatcher
 from app.config import Config
 from app.storage import JsonStore
+from app.services.backup_scheduler import backup_loop
 
 log = logging.getLogger("zdrava.analytics")
 
@@ -34,10 +35,10 @@ async def daily_loop(bot: Bot, service: AnalyticsBot) -> None:
             missing = set(config.owner_ids) - sent
             if not missing:
                 continue
-            report = await service.report("yesterday")
+            report = await service.daily_digest()
             for owner in sorted(missing):
                 try:
-                    await bot.send_message(owner, "📬 Ежедневная сводка\n" + report)
+                    await bot.send_message(owner, report)
                     sent.add(owner)
                     service.store.write("daily_delivery.json", {"date": today, "sent_to": sorted(sent)})
                 except Exception:
@@ -67,11 +68,16 @@ async def main() -> None:
         BotCommand(command="search", description="🔎 Google Search Console"),
         BotCommand(command="status", description="⚙️ Подключения"),
         BotCommand(command="check", description="✅ Проверить API"),
+        BotCommand(command="backup", description="💾 Создать ZIP-бэкап"),
+        BotCommand(command="backups", description="🗄 Список бэкапов"),
+        BotCommand(command="backup_latest", description="📤 Скачать последний ZIP"),
+        BotCommand(command="backup_cleanup", description="🧹 Очистить старые ZIP"),
         BotCommand(command="id", description="🪪 Мой Telegram ID"),
         BotCommand(command="help", description="❔ Помощь"),
         BotCommand(command="cancel", description="✖️ Отменить ввод"),
     ])
     daily = asyncio.create_task(daily_loop(bot, service), name="daily-report")
+    backups_task = asyncio.create_task(backup_loop(bot, service), name="automatic-backups")
     log.info("ZDRAVA analytics started; authorized owners=%s; data=%s", len(config.owner_ids), config.data_dir)
     try:
         # Exactly one running deployment per Telegram token. No webhook is required.
@@ -79,10 +85,12 @@ async def main() -> None:
         await dp.start_polling(bot, handle_signals=True)
     finally:
         daily.cancel()
-        try:
-            await daily
-        except asyncio.CancelledError:
-            pass
+        backups_task.cancel()
+        for task in (daily, backups_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
 
 
