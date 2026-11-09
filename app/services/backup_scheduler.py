@@ -13,18 +13,20 @@ log = logging.getLogger(__name__)
 
 async def backup_loop(bot, service) -> None:
     config = service.config
-    options = service.backup_options
     last_prune_hour = None
     last_attempt_at = -10000000.0
     while True:
         await asyncio.sleep(60)
         try:
             now = datetime.now(ZoneInfo(config.timezone))
+            options = service.preferences.get()
+            service.backups.retention_days = options["retention_days"]
+            service.backups.max_count = options["backup_max_count"]
             hour_key = now.strftime("%Y-%m-%d %H")
             if hour_key != last_prune_hour:
                 await asyncio.to_thread(service.backups.prune)
                 last_prune_hour = hour_key
-            if not options.enabled or now.strftime("%H:%M") < options.time:
+            if not options["backup_enabled"] or now.strftime("%H:%M") < options["backup_time"]:
                 continue
             today = now.date().isoformat()
             state = service.store.read("backup_state.json", {})
@@ -41,7 +43,7 @@ async def backup_loop(bot, service) -> None:
                 "date": today, "filename": info.path.name, "sha256": info.sha256
             })
             log.info("Automatic JSON backup stored: %s", info.path.name)
-            if options.send_telegram:
+            if options["backup_send_telegram"]:
                 with service.backups.preserve(info.path):
                     for owner in config.owner_ids:
                         try:

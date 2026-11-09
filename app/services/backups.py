@@ -20,7 +20,8 @@ import uuid
 import zipfile
 
 
-FILES = ("ad_spend.json", "daily_delivery.json", "last_report.json", "health.json")
+FILES = ("ad_spend.json", "daily_delivery.json", "last_report.json", "health.json",
+         "user_settings.json", "direct_campaigns.json")
 ARCHIVE_RE = re.compile(r"^zdrava_\d{8}T\d{12}Z_(?:manual|automatic)\.zip$")
 SCHEMA = "zdrava-analytics-json-backup-v1"
 MAX_JSON_BYTES = 50 * 1024 * 1024

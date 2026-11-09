@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -21,6 +22,9 @@ from app.storage import JsonStore, money_amount, DataIntegrityError
 from app.services.backups import BackupService, BackupOptions
 from app.services.backup_handlers import register_backup_handlers
 from app.services.daily_digest import compact_daily_digest
+from app.services.direct import DirectClient, DirectError
+from app.services.preferences import Preferences, CampaignAssignments
+from app.services.manager_ui import register_manager_handlers
 
 
 def keyboard(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
@@ -45,6 +49,7 @@ ADS = keyboard(
     (("💰 Добавить расход", "spend:start"),),
     (("💵 Расходы 7 дней", "expenses:week"), ("💵 30 дней", "expenses:month")),
     (("🏷 UTM-кампании", "utm:week"), ("🌐 Источники", "sources:week")),
+    (("📣 Яндекс Директ", "direct:home"),),
     (("🛒 Ozon: статус", "ozon"),),
     (("🏠 Главное меню", "nav:home"),),
 )
@@ -54,7 +59,7 @@ SEO = keyboard(
 )
 SYSTEM = keyboard(
     (("⚙️ Подключения", "status"), ("✅ Проверить API", "check")),
-    (("🗄 Резервные копии", "nav:backups"),),
+    (("🗄 Резервные копии", "nav:backups"), ("✏️ Настройки", "prefs:home")),
     (("🪪 Мой Telegram ID", "id"), ("❔ Помощь", "help")),
     (("🏠 Главное меню", "nav:home"),),
 )
@@ -78,7 +83,7 @@ SPEND_CANCEL = keyboard((("✖️ Отмена", "spend:cancel"),))
 SECTIONS = {
     "home": ("ЗДРАВА | Аналитика\nВыберите раздел:", HOME),
     "traffic": ("📊 Трафик\nПосещения, периоды, источники и UTM:", TRAFFIC),
-    "ads": ("📣 Реклама\nРучной учёт расходов и результаты переходов:", ADS),
+    "ads": ("📣 Реклама\nЯндекс Директ, ручные расходы и переходы:", ADS),
     "seo": ("🔎 SEO / Google\nПоисковая статистика двух лендингов:", SEO),
     "system": ("⚙️ Система\nПодключения и диагностика:", SYSTEM),
     "backups": ("🗄 Резервные копии\nАрхивы JSON в /app/data/backups:", BACKUPS),
@@ -111,6 +116,18 @@ class AnalyticsBot:
             retention_days=self.backup_options.retention_days,
             max_count=self.backup_options.max_count,
             max_total_mb=self.backup_options.max_total_mb)
+        self.preferences = Preferences(store, {
+            "daily_enabled": config.daily_report_enabled,
+            "daily_time": config.daily_report_time,
+            "backup_enabled": self.backup_options.enabled,
+            "backup_time": self.backup_options.time,
+            "backup_send_telegram": self.backup_options.send_telegram,
+            "retention_days": self.backup_options.retention_days,
+            "backup_max_count": self.backup_options.max_count,
+        })
+        self.direct = DirectClient(os.getenv("YANDEX_DIRECT_TOKEN", ""),
+            os.getenv("YANDEX_DIRECT_CLIENT_LOGIN", ""), timeout=config.http_timeout)
+        self.assignments = CampaignAssignments(store)
 
     def allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.config.owner_ids
@@ -122,10 +139,11 @@ class AnalyticsBot:
             f"Счётчик: {self.config.metrika_counter_id}",
             "Цель перехода в Ozon: " + (str(self.config.metrika_ozon_goal_id) if self.config.metrika_ozon_goal_id else "не задана"),
             "Google Search Console: " + ("✅ ключ найден (доступ проверяется при запросе)" if self.gsc.connected else "не настроен"),
+            "Яндекс Директ: " + ("✅ токен задан (доступ проверяется по кнопке)" if self.direct.connected else "не подключён"),
             "Ozon (заказы из внешнего трафика): " + OZON_ATTRIBUTION_STATUS,
             "Wildberries: не подключаем по решению проекта.",
             f"Хранилище: {self.config.data_dir}",
-            "Ежедневный отчёт: " + (f"{self.config.daily_report_time} ({self.config.timezone})" if self.config.daily_report_enabled else "выключен"),
+            "Ежедневный отчёт: " + (f"{self.preferences.get()['daily_time']} ({self.config.timezone})" if self.preferences.get()["daily_enabled"] else "выключен"),
         ])
 
     async def report(self, key: str) -> str:
@@ -236,6 +254,14 @@ class AnalyticsBot:
                 parts.append("Google Search Console: ошибка — " + str(exc))
         else:
             parts.append("Google Search Console: не настроен (необязательно)")
+        if self.direct.connected:
+            try:
+                camps = await self.direct.campaigns()
+                parts.append(f"Яндекс Директ: доступ есть, кампаний: {len(camps)}")
+            except DirectError as exc:
+                parts.append("Яндекс Директ: ошибка — " + str(exc))
+        else:
+            parts.append("Яндекс Директ: не подключён (необязательно)")
         try:
             self.store.write("health.json", {"last_checked": datetime.now().isoformat()})
             parts.append("/app/data: запись JSON работает")
@@ -289,12 +315,12 @@ HELP_TEXT = (
     "❔ ЗДРАВА | Аналитика\n"
     "Выберите тематический раздел в /start. Все функции доступны кнопками.\n\n"
     "📊 Трафик — сегодня, вчера, 7/30 дней, источники и UTM.\n"
-    "📣 Реклама — внесение расходов по товару, суммы за период, UTM и статус Ozon.\n"
+    "📣 Реклама — Директ, привязка кампаний к товарам и ручные расходы.\n"
     "🔎 SEO — Google Search Console.\n"
-    "⚙️ Система — настройки, проверка API, архивы ZIP, ваш ID.\n\n"
+    "⚙️ Система — настройки времени, проверка подключений и резервные копии.\n\n"
     "Команды также доступны вручную: /today /yesterday /week /month "
     "/sources /utm /search /status /check /id /spend /cancel "
-    "/backup /backups /backup_latest /backup_cleanup.\n"
+    "/backup /backups /backup_latest /backup_cleanup /direct /settings.\n"
     "Ограничение: переходы на маркетплейс не доказывают продажи."
 )
 
@@ -478,6 +504,8 @@ def build_dispatcher(service: AnalyticsBot) -> Dispatcher:
             await message.answer(answer, reply_markup=ADS)
         else:
             await message.answer("⚠️ Нужна сумма 0–100000000 с точностью до копейки, например 550,50. Значения с 3+ знаками не округляются.", reply_markup=SPEND_CANCEL)
+
+    register_manager_handlers(router, service)
 
     @router.message()
     async def fallback(message: Message) -> None:

@@ -23,10 +23,13 @@ async def daily_loop(bot: Bot, service: AnalyticsBot) -> None:
     config = service.config
     while True:
         await asyncio.sleep(60)
-        if not config.daily_report_enabled or not service.metrika.connected:
+        if not service.metrika.connected:
+            continue
+        prefs = service.preferences.get()
+        if not prefs["daily_enabled"]:
             continue
         now = datetime.now(ZoneInfo(config.timezone))
-        if now.strftime("%H:%M") < config.daily_report_time:
+        if now.strftime("%H:%M") < prefs["daily_time"]:
             continue
         today = now.date().isoformat()
         try:
@@ -65,6 +68,8 @@ async def main() -> None:
         BotCommand(command="sources", description="🌐 Источники"),
         BotCommand(command="utm", description="🏷 UTM-кампании"),
         BotCommand(command="spend", description="💰 Добавить расход"),
+        BotCommand(command="direct", description="📣 Яндекс Директ"),
+        BotCommand(command="settings", description="✏️ Настройки бота"),
         BotCommand(command="search", description="🔎 Google Search Console"),
         BotCommand(command="status", description="⚙️ Подключения"),
         BotCommand(command="check", description="✅ Проверить API"),
