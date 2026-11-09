@@ -204,7 +204,8 @@ def register_manager_handlers(router: Router, service) -> None:
                 return
             await state.clear()
             try:
-                removed = service.store.delete_spend(product, raw_date)
+                async with service._write_lock:
+                    removed = service.store.delete_spend(product, raw_date)
                 await query.message.answer("✅ Запись удалена." if removed else
                     "Такой записи расходов нет. Другие данные не затронуты.")
             except DataIntegrityError:
