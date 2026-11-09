@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import math
 from dataclasses import dataclass
@@ -64,6 +65,27 @@ def parse_search_stats(payload: object) -> SearchStats:
     return SearchStats(clicks, impressions, clicks / impressions, float(raw_position))
 
 
+
+def _refresh_failure_reason(exc: BaseException) -> str:
+    """Expose only a safe category, never the raw Google response or credentials."""
+    details = str(exc).lower()
+    if "invalid jwt signature" in details:
+        return "invalid_grant: Google отклонил подпись JWT; проверьте, что ключ активен и относится к сервисному аккаунту."
+    if "reasonable timeframe" in details or ("invalid_grant" in details and ("iat" in details or "exp" in details)):
+        return "invalid_grant: неверное время сервера или срок действия JWT."
+    if "invalid_grant" in details:
+        return "invalid_grant: Google отклонил JWT; проверьте активность ключа и часы сервера."
+    if "invalid_scope" in details:
+        return "invalid_scope: Google отклонил запрошенный OAuth scope."
+    if "unauthorized_client" in details:
+        return "unauthorized_client: сервисному аккаунту запрещён выпуск токена с указанными правами."
+    if "invalid_client" in details or "disabled_client" in details or "deleted_client" in details:
+        return "invalid_client: проверьте, что сервисный аккаунт и ключ активны."
+    if "admin_policy_enforced" in details:
+        return "admin_policy_enforced: политика организации блокирует выдачу токена."
+    return "Google отказал в выдаче OAuth-токена (RefreshError). Проверьте IAM и состояние ключа."
+
+
 class SearchConsoleClient:
     def __init__(self, site_url: str, service_account_file: Path, timeout: float = 20, service_account_b64: str = ""):
         self.site_url = site_url
@@ -79,21 +101,45 @@ class SearchConsoleClient:
         try:
             from google.oauth2 import service_account
             from google.auth.transport.requests import Request
+            from google.auth.exceptions import RefreshError, TransportError
+        except ImportError as exc:
+            raise SearchConsoleError(
+                "Google: отсутствует зависимость google-auth/requests в окружении Bothost. Обновите requirements.txt и пересоберите приложение."
+            ) from None
+
+        try:
             if self.service_account_b64:
                 payload = base64.b64decode(self.service_account_b64, validate=True)
                 account_info = json.loads(payload.decode("utf-8"))
-                credentials = service_account.Credentials.from_service_account_info(account_info, scopes=SCOPES)
+                if not isinstance(account_info, dict) or account_info.get("type") != "service_account":
+                    raise ValueError("Expected a service-account JSON")
+                credentials = service_account.Credentials.from_service_account_info(
+                    account_info, scopes=SCOPES)
             else:
                 credentials = service_account.Credentials.from_service_account_file(
                     str(self.credentials_path), scopes=SCOPES)
             credentials.refresh(Request())
             if not credentials.token:
-                raise SearchConsoleError("Google не выдал токен")
+                raise SearchConsoleError("Google не выдал OAuth-токен.")
             return credentials.token
-        except (OSError, ValueError, KeyError, UnicodeError) as exc:
-            raise SearchConsoleError("Невозможно прочитать ключ сервисного аккаунта") from exc
+        except SearchConsoleError:
+            raise
+        except (OSError, binascii.Error, ValueError, KeyError, UnicodeError, json.JSONDecodeError):
+            raise SearchConsoleError(
+                "Google: неверный Base64, повреждённый JSON или недоступный файл ключа."
+            ) from None
+        except RefreshError as exc:
+            raise SearchConsoleError("Google: " + _refresh_failure_reason(exc)) from None
+        except TransportError:
+            raise SearchConsoleError(
+                "Google: не удалось подключиться к OAuth-серверу Google из Bothost (сеть, DNS, SSL или таймаут)."
+            ) from None
         except Exception as exc:
-            raise SearchConsoleError("Ошибка авторизации сервисного аккаунта Google") from exc
+            # Only the exception class is exposed: raw Google responses may
+            # contain details that should not be sent in a Telegram message.
+            raise SearchConsoleError(
+                f"Google: неожиданная ошибка авторизации ({type(exc).__name__})."
+            ) from None
 
     async def by_landing(self, begin: date, end: date, path: str) -> SearchStats:
         if not self.connected:
